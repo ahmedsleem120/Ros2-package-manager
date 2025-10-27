@@ -219,11 +219,20 @@ class ProcessManager:
             return False
         
         try:
-            setup_file = workspace_path / "install" / "setup.bash"
-            if setup_file.exists():
-                full_command = f"source {setup_file} && {' '.join(command)}"
+            setup_file = workspace_path / "install" / "setup.bash" if workspace_path else None
+            # If a raw shell command is provided in the 'command' parameter as a single string,
+            # allow it to be used directly by callers by passing command as a single-element list
+            # with the actual shell string prefixed by 'RAW_SHELL:'. Otherwise construct a
+            # default full_command that sources the workspace setup if available and then runs
+            # the provided command list.
+            if isinstance(command, list) and len(command) == 1 and isinstance(command[0], str) and command[0].strip().startswith('RAW_SHELL:'):
+                # Caller provided a raw shell command: use it as-is (strip the marker)
+                full_command = command[0].split('RAW_SHELL:', 1)[1]
             else:
-                full_command = ' '.join(command)
+                if setup_file and setup_file.exists():
+                    full_command = f"source {setup_file} && {' '.join(command)}"
+                else:
+                    full_command = ' '.join(command)
             
             process = subprocess.Popen(
                 full_command,
@@ -763,6 +772,14 @@ class ParameterDialog(QDialog):
             layout.addWidget(label)
         
         layout.addLayout(form_layout)
+        # Option to build package before running
+        self.build_checkbox = QCheckBox("Build package before run")
+        try:
+            default_build = self.config_manager.load_setting('build_before_run', True)
+        except Exception:
+            default_build = True
+        self.build_checkbox.setChecked(default_build)
+        layout.addWidget(self.build_checkbox)
         
         # Buttons
         button_box = QDialogButtonBox(
@@ -780,6 +797,10 @@ class ParameterDialog(QDialog):
         for name, widget in self.param_widgets.items():
             params[name] = widget.text()
         return params
+
+    def get_build_choice(self) -> bool:
+        """Return whether user chose to build the package before run"""
+        return bool(self.build_checkbox.isChecked())
     
     def save_config(self):
         """Save configuration"""
@@ -1006,7 +1027,8 @@ class ROS2InspectorWidget(QWidget):
             tab_name = f"topic_echo/{topic_name}"
             cmd = ["ros2", "topic", "echo", topic_name]
             if hasattr(main_window, "_do_execute_item"):
-                main_window._do_execute_item(tab_name, cmd)
+                # Do not build when echoing a topic
+                main_window._do_execute_item(tab_name, cmd, build_before_run=False)
             else:
                 QMessageBox.warning(self, "Error", "Cannot echo topic (no handler)")
         except Exception as e:
@@ -1294,6 +1316,16 @@ class ROS2LauncherGUI(QMainWindow):
         export_action = QAction("💾 Export All Logs", self)
         export_action.triggered.connect(self.export_all_logs)
         toolbar.addAction(export_action)
+        # Open a new external terminal (workspace path)
+        open_term_action = QAction("🖥️ Open Terminal", self)
+        open_term_action.triggered.connect(self.open_terminal)
+        toolbar.addAction(open_term_action)
+
+        # Open a new external terminal with workspace sourced
+        open_sourced_action = QAction("⚡ Open Sourced Terminal", self)
+        open_sourced_action.triggered.connect(self.open_sourced_terminal)
+        toolbar.addAction(open_sourced_action)
+
         # Stop mode selector
         self.stop_mode_combo = QComboBox()
         self.stop_mode_combo.addItems(["SIGINT", "SIGTERM"])
@@ -1329,6 +1361,57 @@ class ROS2LauncherGUI(QMainWindow):
         self.recent_combo.addItem("-- Select Recent --")
         for workspace in recent:
             self.recent_combo.addItem(workspace)
+
+    def open_terminal(self):
+        """Open an external terminal at the workspace path (or home if none)."""
+        path = str(self.workspace_path) if self.workspace_path else str(Path.home())
+        # Candidate terminal commands
+        candidates = [
+            ["gnome-terminal", "--", "bash", "-lc", f"cd {path}; exec bash"],
+            ["konsole", "--workdir", path],
+            ["xfce4-terminal", "--working-directory", path],
+            ["x-terminal-emulator", "--working-directory", path],
+            ["xterm", "-e", f"bash -c 'cd {path}; exec bash'"]
+        ]
+        for cmd in candidates:
+            try:
+                subprocess.Popen(cmd)
+                return
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        QMessageBox.warning(self, "Open Terminal", "No supported terminal emulator found on PATH")
+
+    def open_sourced_terminal(self):
+        """Open an external terminal and source the workspace install/setup.bash if present."""
+        if not self.workspace_path:
+            QMessageBox.warning(self, "No Workspace", "Load a workspace first")
+            return
+        setup = self.workspace_path / 'install' / 'setup.bash'
+        path = str(self.workspace_path)
+        if setup.exists():
+            cmd_str = f"cd {path} && source {setup} && exec bash"
+        else:
+            cmd_str = f"cd {path}; exec bash"
+
+        candidates = [
+            ["gnome-terminal", "--", "bash", "-lc", cmd_str],
+            ["konsole", "--workdir", path, "-e", f"bash -lc '{cmd_str}'"],
+            ["xfce4-terminal", "--working-directory", path, "-e", f"bash -lc '{cmd_str}'"],
+            ["x-terminal-emulator", "-e", f"bash -lc '{cmd_str}'"],
+            ["xterm", "-e", f"bash -c '{cmd_str}'"]
+        ]
+
+        for cmd in candidates:
+            try:
+                subprocess.Popen(cmd)
+                return
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+        QMessageBox.warning(self, "Open Terminal", "No supported terminal emulator found on PATH")
     
     def load_recent_workspace(self, workspace_path: str):
         """Load workspace from recent list"""
@@ -1577,9 +1660,10 @@ class ROS2LauncherGUI(QMainWindow):
         dialog = ParameterDialog(item, self.config_manager, self)
         if dialog.exec_() == QDialog.Accepted:
             params = dialog.get_parameters()
-            self.execute_item(item, params)
+            build_flag = dialog.get_build_choice()
+            self.execute_item(item, params, build_before_run=build_flag)
     
-    def execute_item(self, item: ROS2Item, params: Optional[Dict] = None):
+    def execute_item(self, item: ROS2Item, params: Optional[Dict] = None, build_before_run: Optional[bool] = None):
         """Execute a ROS2 item"""
         command = item.get_command(params)
         if not command:
@@ -1598,18 +1682,18 @@ class ROS2LauncherGUI(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.stop_process(tab_name)
                 # Wait a bit for process to stop
-                QTimer.singleShot(500, lambda: self._execute_item_delayed(item, params, tab_name, command))
+                QTimer.singleShot(500, lambda: self._execute_item_delayed(item, params, tab_name, command, build_before_run))
                 return
             else:
                 return
         
-        self._do_execute_item(tab_name, command)
+        self._do_execute_item(tab_name, command, build_before_run)
     
-    def _execute_item_delayed(self, item: ROS2Item, params: Optional[Dict], tab_name: str, command: List[str]):
+    def _execute_item_delayed(self, item: ROS2Item, params: Optional[Dict], tab_name: str, command: List[str], build_before_run: Optional[bool] = None):
         """Execute item after delay"""
-        self._do_execute_item(tab_name, command)
+        self._do_execute_item(tab_name, command, build_before_run)
     
-    def _do_execute_item(self, tab_name: str, command: List[str]):
+    def _do_execute_item(self, tab_name: str, command: List[str], build_before_run: Optional[bool] = None):
         """Actually execute the item"""
         # Create or reuse tab
         if tab_name not in self.active_tabs:
@@ -1631,9 +1715,58 @@ class ROS2LauncherGUI(QMainWindow):
         output_widget.append_output(f"$ {' '.join(command)}\n", "cyan")
         
         log_dir = self.workspace_path / "logs" if self.workspace_path else None
-        success = self.process_manager.start_process(
-            tab_name, command, self.workspace_path, log_dir
-        )
+
+        # Optionally build the package first and then source the workspace in the same shell
+        # and then run the command.
+        raw_shell = None
+        try:
+            # Determine whether we should build: explicit flag wins, otherwise use saved setting
+            if build_before_run is None:
+                should_build = self.config_manager.load_setting('build_before_run', True)
+            else:
+                should_build = bool(build_before_run)
+
+            if should_build and '/' in tab_name:
+                pkg = tab_name.split('/')[0]
+            else:
+                pkg = None
+
+            if pkg and self.workspace_path:
+                # Only build if package exists under src
+                pkg_path = self.workspace_path / 'src' / pkg
+                if not pkg_path.exists():
+                    pkg = None
+
+            if pkg and self.workspace_path:
+                # Build command uses user settings
+                symlink = self.config_manager.load_setting('colcon_symlink', True)
+                workers = int(self.config_manager.load_setting('colcon_parallel_workers', 4) or 4)
+                cmake_args = str(self.config_manager.load_setting('colcon_cmake_args', '') or '')
+
+                build_parts = ["colcon", "build", "--packages-select", pkg]
+                if symlink:
+                    build_parts.append("--symlink-install")
+                build_parts.extend(["--parallel-workers", str(workers)])
+                if cmake_args.strip():
+                    build_parts.extend(["--cmake-args", cmake_args])
+
+                build_cmd = ' '.join(build_parts)
+                setup = str(self.workspace_path / 'install' / 'setup.bash')
+                run_cmd = ' '.join(command)
+                raw_shell = f"cd {self.workspace_path} && {build_cmd} && source {setup} && {run_cmd}"
+
+        except Exception:
+            raw_shell = None
+
+        if raw_shell:
+            output_widget.append_output(f"$ {raw_shell}\n", "cyan")
+            success = self.process_manager.start_process(
+                tab_name, [f"RAW_SHELL:{raw_shell}"], self.workspace_path, log_dir
+            )
+        else:
+            success = self.process_manager.start_process(
+                tab_name, command, self.workspace_path, log_dir
+            )
         
         if success:
             self.status_bar.showMessage(f"Started: {tab_name}")
