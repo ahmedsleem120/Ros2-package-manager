@@ -21,6 +21,8 @@ dist/
 
 # Logs and runtime files
 logs/
+log/
+install/
 *.log
 
 # Local config
