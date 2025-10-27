@@ -48,6 +48,6 @@ Run the unit tests (requires pytest):
 pytest -q
 ```
 
-License
+
 
 This repository includes an MIT license (see LICENSE). Replace the placeholder name/year if desired.
