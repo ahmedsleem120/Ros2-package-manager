@@ -48,18 +48,6 @@ Run the unit tests (requires pytest):
 pytest -q
 ```
 
-Publishing to GitHub
-1. Create an empty repository on GitHub (via website or `gh repo create`).
-2. Add the remote and push:
-
-```bash
-git remote add origin git@github.com:<youruser>/<repo>.git
-git branch -M main
-git push -u origin main
-```
-
-If you want me to help add the remote and push, provide the repository URL (or a GitHub token) and I'll help with the push command.
-
 License
 
 This repository includes an MIT license (see LICENSE). Replace the placeholder name/year if desired.
